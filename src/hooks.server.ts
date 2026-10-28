@@ -215,6 +215,7 @@ if (!initialized) {
 		const shutdown = async () => {
 			console.log('[Server] Shutting down...');
 			stopRssTracker();
+			await import('$lib/server/git').then((m) => m.flushGitSyncDigest()).catch(() => {});
 			await stopSubprocesses();
 			process.exit(0);
 		};

@@ -23,6 +23,7 @@ import { deployStack, getStackDir, notifyStackDeploy } from './stacks';
 import { createRunRecorder } from './deploy-run-record';
 import { hashComposeContent, hashEnvFingerprint } from './deploy-run-record-core';
 import { sendEventNotification } from './notifications';
+import { createGitSyncDigest, formatGitSyncEntry, type GitSyncEntry } from './notifications/git-sync-digest-core';
 import { buildBasicAuthHeader } from './git-auth';
 import { assertSafeRepoUrl, assertSafeGitRef, repoFilePath, repoBaseEnvPath, stripUrlCredentials } from './git-url-safety';
 import { assertSafeRepoTarget } from './git-branch-lookup';
@@ -1305,32 +1306,53 @@ export async function syncGitStack(stackId: number): Promise<SyncResult> {
 	}
 }
 
+// Cron and webhook syncs arrive in bursts (one per stack), so they are collected per
+// environment and sent as one message per event type. See git-sync-digest-core.ts.
+const GIT_SYNC_DIGEST_QUIET_MS = 30_000;
+const GIT_SYNC_DIGEST_MAX_MS = 300_000;
+
+const gitSyncDigest = createGitSyncDigest({
+	quietMs: GIT_SYNC_DIGEST_QUIET_MS,
+	maxMs: GIT_SYNC_DIGEST_MAX_MS,
+	send: async (envId, msg) => {
+		try {
+			await sendEventNotification(msg.event, { title: msg.title, message: msg.message, type: msg.type }, envId ?? undefined);
+		} catch (error) {
+			// Logged only: a notification never changes the deploy outcome.
+			console.error(`[Git-sync] digest notification ${msg.event} failed:`, error instanceof Error ? error.message : String(error));
+		}
+	}
+});
+
+/** Send the collected git-sync notifications now (graceful shutdown). */
+export function flushGitSyncDigest(): Promise<void> {
+	return gitSyncDigest.flush();
+}
+
 /**
  * Fire git_sync_success / git_sync_failed / git_sync_skipped for a git-stack deploy, from
  * deployGitStack (webhook, manual API, create/update, scheduler) and from the UI deploy
- * deployGitStackWithProgress. Best-effort: never changes the deploy outcome.
+ * deployGitStackWithProgress. Cron and webhook results go through the digest; any other
+ * trigger sends at once. Best-effort: never changes the deploy outcome.
  */
-async function notifyGitSync(stackName: string, envId: number | null | undefined, result: { success: boolean; error?: string; skipped?: boolean }): Promise<void> {
+async function notifyGitSync(
+	stackName: string,
+	envId: number | null | undefined,
+	result: { success: boolean; error?: string; skipped?: boolean },
+	triggeredBy?: ScheduleTrigger
+): Promise<void> {
 	try {
-		if (result.success && result.skipped) {
-			await sendEventNotification('git_sync_skipped', {
-				title: 'Git sync skipped',
-				message: `Stack "${stackName}" sync skipped: no changes detected`,
-				type: 'info'
-			}, envId ?? undefined);
-		} else if (result.success) {
-			await sendEventNotification('git_sync_success', {
-				title: 'Git stack deployed',
-				message: `Stack "${stackName}" was synced and deployed successfully`,
-				type: 'success'
-			}, envId ?? undefined);
-		} else {
-			await sendEventNotification('git_sync_failed', {
-				title: 'Git sync failed',
-				message: `Stack "${stackName}" sync failed: ${result.error || 'unknown error'}`,
-				type: 'error'
-			}, envId ?? undefined);
+		const entry: GitSyncEntry = {
+			event: result.success ? (result.skipped ? 'git_sync_skipped' : 'git_sync_success') : 'git_sync_failed',
+			stackName,
+			error: result.error
+		};
+		if (triggeredBy === 'cron' || triggeredBy === 'webhook') {
+			gitSyncDigest.add(envId ?? null, entry);
+			return;
 		}
+		const msg = formatGitSyncEntry(entry);
+		await sendEventNotification(msg.event, { title: msg.title, message: msg.message, type: msg.type }, envId ?? undefined);
 	} catch (error) {
 		// Logged only: a notification never changes the deploy outcome.
 		console.error(`[Stack:${stackName}] git sync notification failed:`, error instanceof Error ? error.message : String(error));
@@ -1446,7 +1468,7 @@ export async function deployGitStack(
 		if (!(syncResult.error ?? '').includes('Sync already in progress')) {
 			await notifyStackDeploy(gitStack.stackName, gitStack.environmentId, failResult, true);
 		}
-		await notifyGitSync(gitStack.stackName, gitStack.environmentId, failResult);
+		await notifyGitSync(gitStack.stackName, gitStack.environmentId, failResult, triggeredBy);
 		return failResult;
 	}
 
@@ -1484,7 +1506,7 @@ export async function deployGitStack(
 			output: 'No changes detected, skipping redeploy',
 			skipped: true
 		};
-		await notifyGitSync(gitStack.stackName, gitStack.environmentId, skippedResult);
+		await notifyGitSync(gitStack.stackName, gitStack.environmentId, skippedResult, triggeredBy);
 		return skippedResult;
 	}
 
@@ -1586,7 +1608,7 @@ export async function deployGitStack(
 		// stack on 'synced' is the stuck state this records against.
 		await markGitStackDeployFailed(stackId, logPrefix, error instanceof Error ? error.message : String(error));
 		// deployStack sent stack_deploy_failed before throwing; this is the git half.
-		await notifyGitSync(gitStack.stackName, gitStack.environmentId, { success: false, error: error instanceof Error ? error.message : String(error) });
+		await notifyGitSync(gitStack.stackName, gitStack.environmentId, { success: false, error: error instanceof Error ? error.message : String(error) }, triggeredBy);
 		throw error;
 	}
 
@@ -1656,7 +1678,7 @@ export async function deployGitStack(
 
 	// git_sync_success / git_sync_failed for the actual deploy result. deployStack sent
 	// stack_* only to the channels not subscribed to this event (isGitDeploy).
-	await notifyGitSync(gitStack.stackName, gitStack.environmentId, result);
+	await notifyGitSync(gitStack.stackName, gitStack.environmentId, result, triggeredBy);
 	return result;
 }
 
